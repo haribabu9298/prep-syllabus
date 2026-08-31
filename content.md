@@ -1651,53 +1651,356 @@ spiffe://cluster.local/ns/prod/sa/billing-service-sa
 
 ---
 
-# Part 7: Certificate Management
+# Part 7: Certificate Management, Automation & Security
 
 ---
 
-## 7.1 Certificate Chain & PKI
+## 7.1 Certificate Chain & Public Key Infrastructure (PKI)
+
+### The Chain of Trust
+
+Every HTTPS connection relies on a hierarchy of cryptographic certificates that establish trust from a leaf certificate (the domain you visit) all the way up to a root certificate embedded in your operating system.
 
 ```
 Leaf Certificate (api.example.com)
-       │  signed by
-       ▼
-Intermediate CA (Let's Encrypt R3)
-       │  signed by
-       ▼
-Root CA (ISRG Root X1) ← stored in OS trust stores
-                            /etc/ssl/certs/ (Linux)
-                            /etc/pki/tls/certs/ (RHEL)
-                            Keychain (macOS)
-                            Windows Certificate Store
+        │  signed by (contains Intermediate CA's public key)
+        ▼
+Intermediate CA (Let's Encrypt R3 / DigiCert SHA2 Secure)
+        │  signed by (contains Root CA's public key)
+        ▼
+Root CA (ISRG Root X1 / DigiCert Global Root CA)
+        │  self-signed
+        ▼
+Pre-installed in OS/Browser Trust Stores
 ```
 
-The Root CA is pre-installed in operating systems and browsers. The chain of trust flows from Root → Intermediate → Leaf. Each certificate contains the public key of the next level signed by the previous level's private key.
+### How the Chain Works
 
-## 7.2 ACME Protocol & Cert-Manager
+Each certificate contains the **public key** of the next level, signed by the **private key** of the level above it. Verification is a bottom-up process:
 
-### HTTP-01 Challenge (Cannot issue wildcards)
 ```
-1. Cert-Manager creates temporary Pod + Ingress at:
-   http://example.com/.well-known/acme-challenge/<token>
-2. Let's Encrypt HTTP client hits port 80, fetches the token
-3. Token must match the account key fingerprint
-4. Proves domain control over HTTP endpoint
+1. Server presents: Leaf Cert + Intermediate CA Cert
+2. Browser uses Root CA's public key (from trust store) to verify Intermediate CA's signature
+3. Browser uses Intermediate CA's public key to verify Leaf Cert's signature
+4. Browser checks Leaf Cert's validity period, hostname match (SAN), and revocation status (CRL/OCSP)
+5. If ALL checks pass → chain of trust is established → TLS handshake proceeds
 ```
 
-### DNS-01 Challenge (Required for wildcards)
+### Why Root CAs Are Stored in OS Trust Stores
+
+The Root CA is the **ultimate anchor of trust**. It is pre-installed in operating systems and browsers during manufacturing or OS installation:
+
+| OS | Trust Store Location |
+|----|---------------------|
+| Linux (Debian/Ubuntu) | `/etc/ssl/certs/` (managed by `ca-certificates` package) |
+| Linux (RHEL/CentOS) | `/etc/pki/tls/certs/` |
+| macOS | Keychain Access (`/System/Library/Keychains/SystemRootCertificates.keychain`) |
+| Windows | Windows Certificate Store (`certlm.msc`) |
+
+**Why not distribute the full chain from the server?** If servers had to send the entire chain (including root) on every connection, it would add unnecessary bandwidth. More importantly, root CAs are **offline by design** — their private keys are stored on air-gapped machines. The root CA signs intermediate CA certificates, and the intermediate signs leaf certificates. If a root CA were ever compromised, every certificate in the world would need to be distrusted. Keeping it offline and pre-distributed as a trusted anchor limits the blast radius.
+
+### Certificate Transparency (CT)
+
+All certificates issued by public CAs must be logged in Certificate Transparency logs — publicly auditable append-only ledgers that allow domain owners to detect rogue certificates issued for their domains.
+
+### Common Certificate Formats
+
+| Format | Extension | Description |
+|--------|-----------|-------------|
+| PEM | `.pem`, `.crt`, `.cert` | Base64-encoded, text-readable, wrapped in `-----BEGIN CERTIFICATE-----` |
+| DER | `.der`, `.cer` | Binary-encoded, compact |
+| PFX/P12 | `.pfx`, `.p12` | Password-protected archive containing private key + certificate chain |
+| PEM Key | `.key`, `.pem` | Contains the private key (`-----BEGIN PRIVATE KEY-----`) |
+
+---
+
+## 7.2 Certificate Automation — ACME Protocol & Let's Encrypt
+
+### The Problem ACME Solves
+
+Before ACME, obtaining an SSL/TLS certificate was a manual process: generate a CSR, submit it to a CA, complete domain validation (often via email), download the certificate, and manually install it. Certificates expired after 1 year, and organizations often forgot to renew, leading to outages and security warnings.
+
+**Let's Encrypt** (launched 2016) disrupted this by providing **free, automated, open certificates** using the **ACME (Automated Certificate Management Environment)** protocol (RFC 8555).
+
+### ACME Protocol Flow
+
 ```
-1. Cert-Manager uses cloud API credentials (Route 53, Cloudflare)
-2. Creates DNS TXT record: _acme-challenge.example.com → <token>
-3. Let's Encrypt DNS resolver queries public DNS for the TXT record
-4. Token matches → domain ownership verified
+CLIENT                                          CA SERVER
+  │                                                │
+  │── 1. Register Account ──────────────────────►│
+  │     • Generate ACME account key pair          │
+  │     • Agree to terms of service               │
+  │     ◄─ 2. Account URL + Nonce ──────────────│
+  │                                                │
+  │── 3. Generate CSR for domain                 │
+  │     • e.g., api.example.com                  │
+  │     • Extract public key from CSR            │
+  │                                                │
+  │── 4. Request Authorization ─────────────────►│
+  │     • "Prove you control api.example.com"    │
+  │     • CA returns challenges                  │
+  │                                                │
+  │── 5a. HTTP-01: Deploy challenge file         │
+  │     OR                                                       │
+  │── 5b. DNS-01: Create TXT record              │
+  │                                                │
+  │── 6. Inform CA challenge is ready ─────────►│
+  │                                                │
+  │◄── 7. CA validates challenge ──────────────│
+  │     • HTTP-01: Fetches token from domain     │
+  │     • DNS-01: Queries public DNS for TXT     │
+  │                                                │
+  │── 8. Finalize order (submit CSR) ──────────►│
+  │                                                │
+  │◄── 9. Issue certificate ───────────────────│
+  │     • Leaf cert + Intermediate cert          │
+  │                                                │
+  │── 10. Store certificate + private key ──────│
+  │     • Typically as Kubernetes Secret         │
+  │                                                │
+  │◄── 11. Automatic renewal (before expiry) ──│
+  │     • Cert-Manager triggers renewal at       │
+  │       ~80% of lifetime (e.g., 60 days for    │
+  │       90-day cert)                           │
 ```
+
+### HTTP-01 Challenge (No Wildcard Support)
+
+```
+1. Cert-Manager creates a temporary Pod and Ingress:
+   URL: http://example.com/.well-known/acme-challenge/<token>
+   
+   Response body: <token>.<thumbprint>
+   
+2. Let's Encrypt's validation server:
+   - Resolves example.com's A record
+   - Makes an HTTP GET request to port 80
+   - Fetches: http://example.com/.well-known/acme-challenge/<token>
+   - Verifies the token matches the account key fingerprint
+   
+3. Why it can't issue wildcards:
+   - HTTP-01 proves control over a SPECIFIC hostname
+   - A wildcard (*.example.com) covers infinite subdomains
+   - You cannot provision a challenge file for every possible subdomain
+   - The validation server would need to query *.example.com which is meaningless
+```
+
+**Limitation**: HTTP-01 requires port 80 to be publicly accessible. If your ingress only exposes HTTPS (port 443), you must configure a separate HTTP ingress for ACME challenges, or use a redirect that excludes the `.well-known` path.
+
+### DNS-01 Challenge (Wildcard Support ✅)
+
+```
+1. Cert-Manager uses cloud API credentials (stored in K8s Secret):
+   - AWS Route 53 API key / IAM role
+   - Cloudflare API token
+   - Google Cloud DNS service account
+   
+2. Cert-Manager creates DNS TXT record:
+   _acme-challenge.example.com.  IN  TXT  "<token>"
+   
+3. Let's Encrypt's validation server:
+   - Queries public DNS for _acme-challenge.example.com
+   - Verifies the TXT record matches the expected value
+   - Queries recursively through the DNS hierarchy to find the authoritative NS
+   
+4. Why it supports wildcards:
+   - DNS proves control over the entire domain (zone)
+   - Creating a TXT record at _acme-challenge.example.com proves you manage the zone
+   - A wildcard cert (*.example.com) is valid for ALL subdomains under the zone
+   - No per-subdomain challenge needed — one zone-level verification covers everything
+   
+5. After validation, Cert-Manager automatically cleans up the TXT record
+```
+
+**Cloud DNS API Integration**: Cert-Manager uses built-in "solvers" for each DNS provider:
+- `route53`: Uses AWS SDK to create/delete TXT records in Route 53 hosted zones
+- `cloudflare`: Uses Cloudflare API to manage DNS records
+- `azure-dns`: Azure DNS API
+- `google-dns`: Google Cloud DNS API
+- `acmedns`: ACME DNS service (self-hosted alternative)
+
+### Cert-Manager Custom Resources in Kubernetes
+
+**ClusterIssuer** (cluster-scoped — defines HOW to get certificates):
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+    - dns01:
+        route53:
+          region: us-east-1
+          roleARN: arn:aws:iam::123456789012:role/cert-manager-route53
+```
+
+**Certificate** (namespace-scoped — defines WHAT to get):
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: api-tls
+  namespace: production
+spec:
+  secretName: api-tls-secret        ← K8s Secret where cert is stored
+  duration: 2160h                   ← 90 days (default Let's Encrypt)
+  renewBefore: 360h                 ← Renew at 60% of lifetime (~54 days)
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - api.example.com
+    - api.production.example.com
+```
+
+**Auto-Renewal**: Cert-Manager checks certificate expiry on a periodic schedule (default: every 24 hours). When a certificate reaches the `renewBefore` threshold (or ~80% of total lifetime), Cert-Manager automatically:
+1. Re-runs the ACME challenge (HTTP-01 or DNS-01)
+2. Obtains a new certificate from Let's Encrypt
+3. Stores it in the same K8s Secret
+4. The Ingress controller picks up the updated secret automatically
+
+This eliminates the 90-day manual renewal burden that caused widespread outages before automation existed.
+
+---
 
 ## 7.3 TLS Termination vs Passthrough
 
-| Mode | Description | Security Implication |
-|------|-------------|---------------------|
-| **Termination** | LB/Ingress decrypts HTTPS, forwards plain HTTP to backend over private network | Backend traffic is unencrypted within the VPC (acceptable if VPC is private) |
-| **Passthrough** | LB forwards encrypted packets directly to pod without decrypting | End-to-end encryption preserved; LB cannot inspect/policy traffic |
+When traffic enters a Kubernetes cluster through an Ingress or Load Balancer, there are two fundamentally different approaches to handling TLS encryption. The choice affects security posture, observability, and where you manage certificates.
+
+### TLS Termination (Decrypt at the Edge)
+
+```
+[ INTERNET CLIENT ]
+        │ HTTPS (TLS encrypted)
+        ▼
+[ LOAD BALANCER / INGRESS CONTROLLER ]
+        │ 1. TLS termination: LB presents its certificate, decrypts traffic
+        │ 2. Extracts HTTP request from encrypted payload
+        │ 3. Strips TLS headers
+        ▼
+[ PRIVATE NETWORK — UNENCRYPTED HTTP ]
+        │ Plain HTTP (port 80) or gRPC
+        ▼
+[ BACKEND PODS ]
+        │ Receive plain HTTP request
+        │ No TLS processing needed
+```
+
+**How it works**:
+1. The Load Balancer / Ingress Controller (Nginx Ingress, AWS ALB, HAProxy) presents a TLS certificate to the client
+2. The TLS handshake completes at the edge — the LB terminates the encrypted connection
+3. The LB decrypts the HTTPS traffic, extracts the HTTP request
+4. The plain HTTP request is forwarded to backend pods over the private network (VPC, cluster network)
+5. Backend pods never see encrypted traffic — they process plain HTTP
+
+**Advantages**:
+- **Observability**: The LB/Ingress can inspect HTTP headers, paths, cookies — enabling path-based routing, rate limiting, WAF rules, canary deployments
+- **Simplified pod config**: Backend pods don't need TLS certificates, private keys, or TLS termination code
+- **Centralized certificate management**: One certificate at the edge protects all backends
+- **Offloading**: TLS decryption is CPU-intensive — offloading to dedicated hardware/LB saves pod resources
+- **Service mesh compatibility**: Works with mTLS between pods (the LB does external TLS, service mesh does internal mTLS)
+
+**Disadvantages**:
+- **Traffic is unencrypted inside the network**: If an attacker gains access to the internal network/VPC, they can read HTTP traffic in transit
+- **Trust boundary at the LB**: The LB sees all unencrypted traffic including headers, cookies, and potentially sensitive data
+- **Compliance concerns**: Some regulations (HIPAA, PCI-DSS) require end-to-end encryption
+- **LB as single point of trust**: If the LB is compromised, all traffic is exposed
+
+**Mitigation**: Use private VPC networks, security groups, network policies, and pod-to-pod mTLS (Istio/Linkerd) to secure internal traffic even after edge termination.
+
+**Typical deployment**:
+- AWS ALB → Nginx Ingress → EKS Pods (ALB terminates TLS, Nginx handles L7 routing)
+- Nginx Ingress Controller → Backend Pods (Nginx terminates TLS, passes HTTP to pods)
+- Cloudflare → ALB → Nginx → Pods (Cloudflare terminates at edge, ALB terminates at network edge)
+
+### TLS Passthrough (End-to-End Encryption)
+
+```
+[ INTERNET CLIENT ]
+        │ HTTPS (TLS encrypted)
+        ▼
+[ LOAD BALANCER / INGRESS CONTROLLER ]
+        │ 1. Does NOT decrypt traffic
+        │ 2. Forwards raw TCP stream (encrypted packets) to pods
+        │ 3. No TLS handshake — transparent proxy
+        ▼
+[ PRIVATE NETWORK — ENCRYPTED ]
+        │ TLS stream forwarded as-is
+        ▼
+[ BACKEND PODS ]
+        │ Each pod has its own TLS certificate
+        │ Pod's TLS termination (e.g., Nginx in pod, app-level TLS) handles handshake
+        │ Decrypts traffic locally
+```
+
+**How it works**:
+1. The Load Balancer does NOT perform TLS termination
+2. The LB acts as a TCP proxy — it forwards the raw encrypted TLS stream directly to the destination pod
+3. The TLS handshake occurs directly between the client and the pod
+4. The pod presents its own certificate and terminates the TLS connection locally
+5. The LB never sees the decrypted HTTP content
+
+**Advantages**:
+- **End-to-end encryption**: Traffic remains encrypted from client to pod. No unencrypted traffic traverses the internal network.
+- **Pod-level certificate control**: Each pod/microservice can present its own certificate with its own identity — enables fine-grained mTLS
+- **LB cannot inspect traffic**: The load balancer has no access to HTTP headers, cookies, or payload — useful for privacy-sensitive applications
+- **No trust boundary at LB**: The LB is a dumb TCP proxy. Compromising the LB gives an attacker only encrypted packets.
+- **Compliance-friendly**: Meets strict regulatory requirements for end-to-end encryption
+
+**Disadvantages**:
+- **No L7 observability at the LB**: The LB cannot inspect HTTP headers, paths, or status codes. No path-based routing, no WAF, no rate limiting at the edge
+- **Complex certificate management**: Every pod/service needs its own certificate, private key, and TLS configuration. Certificates must be rotated across all pods.
+- **No centralized cert management**: Certificates are distributed across pods rather than centralized at the ingress
+- **Higher pod resource usage**: Every pod must run TLS termination, consuming CPU for encryption/decryption
+- **Health checks are limited**: TCP-level health checks only (can't do HTTP-level health checks without TLS)
+- **SNI limitations**: The LB can see SNI (in plaintext ClientHello) but cannot route based on SNI unless it has the certificate fingerprint or uses advanced proxy protocols
+
+**Typical deployment**:
+- Nginx Ingress with `nginx.ingress.kubernetes.io/ssl-passthrough: "true"` annotation
+- AWS Network Load Balancer (NLB) in TCP mode forwarding to pod TLS
+- Service mesh sidecars handling TLS passthrough with mTLS
+- Database connections (PostgreSQL, MySQL) that require TLS end-to-end
+
+### Comparison Table
+
+| Aspect | TLS Termination | TLS Passthrough |
+|--------|----------------|-----------------|
+| **Where TLS is decrypted** | Load Balancer / Ingress | Backend Pod |
+| **Traffic to backend** | Plain HTTP (private network) | HTTPS/TLS (encrypted) |
+| **LB can inspect HTTP** | ✅ Yes — headers, paths, cookies | ❌ No — only TCP stream + SNI |
+| **Path-based routing** | ✅ Yes — ALB/Nginx routes by path | ❌ No — must use TCP/4-layer routing |
+| **Certificate management** | Centralized at LB (one cert) | Distributed per pod (many certs) |
+| **Internal network security** | ❌ Unencrypted between LB and pods | ✅ End-to-end encrypted |
+| **Resource overhead on pods** | Low — no TLS processing | High — each pod handles TLS |
+| **WAF / Rate Limiting** | ✅ Possible at LB | ❌ Not possible at LB |
+| **mTLS compatibility** | Compatible with internal mTLS | Native end-to-end encryption |
+| **Best for** | Standard microservices, web apps | Compliance workloads, security-sensitive apps |
+| **Common implementations** | ALB + Ingress, Nginx Ingress | Nginx ssl-passthrough, NLB TCP mode |
+
+### Hybrid Approach
+
+In production environments, a hybrid approach is common:
+
+```
+Client → Cloudflare (TLS termination) → AWS ALB (TLS termination) → Nginx Ingress (TLS termination) → Pod (plain HTTP)
+                                                                                    │
+                                                                                    ▼
+                                                              Pod-to-pod mTLS (service mesh)
+                                                                                    │
+                                                                                    ▼
+                                                              Internal service-to-service (encrypted)
+```
+
+- **External layers**: TLS terminated at Cloudflare (edge) and ALB (network edge) for DDoS protection, WAF, and L7 routing
+- **Ingress**: TLS terminated at Nginx Ingress for path-based routing to services
+- **Internal**: mTLS between pods for service-to-service encryption
+- **Result**: Maximum observability at the edge + encryption within the cluster + manageable certificate overhead
 
 ---
 
